@@ -58,6 +58,8 @@ The app parses raw free-text receipt notes by calling the Google Gemini API. Thi
 
 Gemini is attempted first for flexible parsing, and the app automatically falls back to rule-based extraction if the AI call fails, so the user experience is never interrupted.
 
+Gemini API integration required significant debugging - the correct configuration turned out to be the gemini-3.6-flash model with the X-goog-api-key header, since newer/older model names and query-parameter auth both failed. This is documented in case it's useful for future reference.
+
 Set the API key before starting the app:
 ```bash
 set GEMINI_API_KEY=your_key_here
@@ -83,18 +85,18 @@ This keeps the data model predictable and makes reporting and finance totals eas
 
 The UI hides self-approval actions where appropriate, but the backend also enforces this independently. Even if someone sends a direct API request or manipulates the UI, the server blocks a manager from approving or rejecting their own claim.
 
+### Audit history is implemented
+
+The `claim_history` table records an audit entry for every claim status change, including submission, approval, rejection, and payment.
+
 ## AI Tools Used
 
 - Claude (Anthropic) was used to break down the brief, plan the data model and business rules, and help shape the implementation approach.
 - OpenAI Codex (in VS Code) was used to generate the full-stack implementation with a Node/Express backend and SQLite database.
 
-## What I'd Do Next With Another Week
+## What I'd Do Next
 
-- Integrated Gemini for AI-based receipt parsing with a rule-based fallback for resilience. The Gemini API key encountered persistent authentication issues within the project's time constraints, so the app currently runs on the fallback path - with more time, I'd resolve the Google Cloud project/API key configuration to enable the primary AI path.
-- Add photo/screenshot upload support for receipts
-- Add proper authentication instead of the demo role-switching dropdown
-- Add richer analytics and export reports for finance review
-- Add email notifications on approval, rejection, or payment
+Text-based receipt parsing now uses Gemini AI (gemini-3.6-flash) successfully, with automatic fallback to rule-based extraction if the API call fails. Photo/screenshot upload is implemented end-to-end, but the Gemini vision call for images currently fails with an API rejection I wasn't able to fully diagnose in the available time - photo uploads currently fall back to manual entry. With more time, I'd resolve the image-specific API issue and add proper authentication in place of the demo role-switcher.
 
 ## Repository Notes
 
