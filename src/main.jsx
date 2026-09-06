@@ -147,8 +147,74 @@ function App() {
   );
 }
 
+function ClaimDetailView({ claimId, onClose, user }) {
+  const [detail, setDetail] = React.useState(null);
+  const [loading, setLoading] = React.useState(true);
+
+  React.useEffect(() => {
+    if (!claimId) return;
+
+    const loadDetail = async () => {
+      try {
+        const data = await fetchJson(`${API}/claims/${claimId}`, { headers: { 'x-user-id': String(user?.id || 1) } });
+        setDetail(data);
+      } catch (err) {
+        alert(err.message);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    loadDetail();
+  }, [claimId, user]);
+
+  if (!claimId) return null;
+
+  if (loading) return <div className="detail-panel"><p>Loading claim details...</p></div>;
+  if (!detail || !detail.claim) return null;
+
+  const historyText = (detail.history || []).map((entry) => {
+    const action = entry.action.charAt(0).toUpperCase() + entry.action.slice(1);
+    const actor = entry.performer_name || 'System';
+    const date = formatDate(entry.timestamp);
+    return `${action} by ${actor} on ${date}`;
+  }).join(' → ');
+
+  return (
+    <div className="detail-panel">
+      <div className="detail-header">
+        <div>
+          <p className="detail-kicker">Claim details</p>
+          <h3>{detail.claim.vendor} • {formatCurrency(detail.claim.amount)}</h3>
+        </div>
+        <button className="ghost small" onClick={onClose}>Close</button>
+      </div>
+
+      <div className="detail-grid">
+        <div><strong>Status:</strong> <span className={getStatusBadge(detail.claim.status).className}>{getStatusBadge(detail.claim.status).label}</span></div>
+        <div><strong>Category:</strong> {detail.claim.category}</div>
+        <div><strong>Expense date:</strong> {formatDate(detail.claim.expense_date)}</div>
+        <div><strong>Submitted by:</strong> {detail.claim.submitted_by_name}</div>
+      </div>
+
+      <div className="history-box">
+        <h4>Audit history</h4>
+        <p>{historyText || 'No activity logged yet.'}</p>
+        <ul>
+          {(detail.history || []).map((entry) => (
+            <li key={entry.id}>
+              <strong>{entry.action.charAt(0).toUpperCase() + entry.action.slice(1)}</strong> by {entry.performer_name || 'System'} on {formatDate(entry.timestamp)}
+            </li>
+          ))}
+        </ul>
+      </div>
+    </div>
+  );
+}
+
 function StaffDashboard({ user, claims, refresh }) {
   const [showForm, setShowForm] = React.useState(false);
+  const [selectedClaimId, setSelectedClaimId] = React.useState(null);
   const [rawText, setRawText] = React.useState('');
   const [parsed, setParsed] = React.useState(null);
   const [duplicateWarning, setDuplicateWarning] = React.useState(null);
@@ -301,6 +367,7 @@ function StaffDashboard({ user, claims, refresh }) {
             <th>Amount</th>
             <th>Date</th>
             <th>Status</th>
+            <th>Action</th>
           </tr>
         </thead>
         <tbody>
@@ -311,15 +378,20 @@ function StaffDashboard({ user, claims, refresh }) {
               <td>{formatCurrency(claim.amount)}</td>
               <td>{formatDate(claim.expense_date)}</td>
               <td><span className={getStatusBadge(claim.status).className}>{getStatusBadge(claim.status).label}</span></td>
+              <td><button className="ghost small" onClick={() => setSelectedClaimId(claim.id)}>Details</button></td>
             </tr>
           ))}
         </tbody>
       </table>
+
+      <ClaimDetailView claimId={selectedClaimId} onClose={() => setSelectedClaimId(null)} user={user} />
     </div>
   );
 }
 
 function ManagerDashboard({ user, claims, refresh }) {
+  const [selectedClaimId, setSelectedClaimId] = React.useState(null);
+
   const updateClaimStatus = async (claimId, status) => {
     try {
       await fetchJson(`${API}/claims/${claimId}/status`, {
@@ -358,22 +430,29 @@ function ManagerDashboard({ user, claims, refresh }) {
               <td>{formatDate(claim.expense_date)}</td>
               <td><span className={getStatusBadge(claim.status).className}>{getStatusBadge(claim.status).label}</span></td>
               <td>
-                {claim.status === 'submitted' && (
-                  <div className="button-row compact">
-                    <button className="primary small" onClick={() => updateClaimStatus(claim.id, 'approved')}>Approve</button>
-                    <button className="danger small" onClick={() => updateClaimStatus(claim.id, 'rejected')}>Reject</button>
-                  </div>
-                )}
+                <div className="button-row compact">
+                  <button className="ghost small" onClick={() => setSelectedClaimId(claim.id)}>Details</button>
+                  {claim.status === 'submitted' && (
+                    <>
+                      <button className="primary small" onClick={() => updateClaimStatus(claim.id, 'approved')}>Approve</button>
+                      <button className="danger small" onClick={() => updateClaimStatus(claim.id, 'rejected')}>Reject</button>
+                    </>
+                  )}
+                </div>
               </td>
             </tr>
           ))}
         </tbody>
       </table>
+
+      <ClaimDetailView claimId={selectedClaimId} onClose={() => setSelectedClaimId(null)} user={user} />
     </div>
   );
 }
 
 function FinanceDashboard({ user, data, refresh }) {
+  const [selectedClaimId, setSelectedClaimId] = React.useState(null);
+
   const payClaim = async (claimId) => {
     try {
       await fetchJson(`${API}/claims/${claimId}/status`, {
@@ -444,12 +523,17 @@ function FinanceDashboard({ user, data, refresh }) {
               <td>{formatCurrency(claim.amount)}</td>
               <td><span className={getStatusBadge(claim.status).className}>{getStatusBadge(claim.status).label}</span></td>
               <td>
-                {claim.status === 'approved' && <button className="primary small" onClick={() => payClaim(claim.id)}>Mark as Paid</button>}
+                <div className="button-row compact">
+                  <button className="ghost small" onClick={() => setSelectedClaimId(claim.id)}>Details</button>
+                  {claim.status === 'approved' && <button className="primary small" onClick={() => payClaim(claim.id)}>Mark as Paid</button>}
+                </div>
               </td>
             </tr>
           ))}
         </tbody>
       </table>
+
+      <ClaimDetailView claimId={selectedClaimId} onClose={() => setSelectedClaimId(null)} user={user} />
     </div>
   );
 }

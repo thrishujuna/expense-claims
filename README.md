@@ -52,9 +52,21 @@ Before a new claim is finalized, the app checks prior claims for the same user a
 
 This is intentionally a warning flow, not a hard block, because legitimate repeat expenses can happen in real life and the user may be submitting a different transaction that happens to share similar details.
 
-### Receipt parsing is rule-based, not an LLM-based
+### Receipt parsing now uses Gemini
 
-The app parses raw free-text receipt notes using regex and keyword matching rather than calling an external LLM API. This keeps the project lightweight, fast, and free to run locally without extra API keys or dependency overhead.
+The app parses raw free-text receipt notes by calling the Google Gemini API. This allows more flexible extraction of vendor names, amounts, categories, and dates without brittle regex rules.
+
+Gemini is attempted first for flexible parsing, and the app automatically falls back to rule-based extraction if the AI call fails, so the user experience is never interrupted.
+
+Set the API key before starting the app:
+```bash
+set GEMINI_API_KEY=your_key_here
+```
+
+On macOS/Linux, use:
+```bash
+export GEMINI_API_KEY=your_key_here
+```
 
 ### Categories are fixed
 
@@ -78,10 +90,10 @@ The UI hides self-approval actions where appropriate, but the backend also enfor
 
 ## What I'd Do Next With Another Week
 
-- Replace rule-based receipt parsing with a real LLM call for more flexible extraction
+- Integrated Gemini for AI-based receipt parsing with a rule-based fallback for resilience. The Gemini API key encountered persistent authentication issues within the project's time constraints, so the app currently runs on the fallback path - with more time, I'd resolve the Google Cloud project/API key configuration to enable the primary AI path.
 - Add photo/screenshot upload support for receipts
 - Add proper authentication instead of the demo role-switching dropdown
-- Add an audit log tracking every status change, who made it, and when
+- Add richer analytics and export reports for finance review
 - Add email notifications on approval, rejection, or payment
 
 ## Repository Notes

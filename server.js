@@ -1,14 +1,23 @@
+import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import sqlite3 from 'sqlite3';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 const port = process.env.PORT || 5000;
+const geminiApiKey = process.env.GEMINI_API_KEY || '';
+
+if (geminiApiKey) {
+  console.log(`Gemini API key loaded from env: ${geminiApiKey.slice(0, 6)}...`);
+} else {
+  console.log('Gemini API key loaded from env: MISSING');
+}
 
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
@@ -45,6 +54,18 @@ const ensureTables = () => {
         paid_at TEXT,
         FOREIGN KEY (submitted_by) REFERENCES users(id),
         FOREIGN KEY (approved_by) REFERENCES users(id)
+      )
+    `);
+
+    db.run(`
+      CREATE TABLE IF NOT EXISTS claim_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        claim_id INTEGER NOT NULL,
+        action TEXT NOT NULL CHECK(action IN ('submitted','approved','rejected','paid')),
+        performed_by INTEGER,
+        timestamp TEXT NOT NULL,
+        FOREIGN KEY (claim_id) REFERENCES claims(id),
+        FOREIGN KEY (performed_by) REFERENCES users(id)
       )
     `);
   });
@@ -110,6 +131,19 @@ const seedUsersAndClaims = () => {
             `INSERT INTO claims (submitted_by, raw_text, vendor, amount, category, expense_date, description, status, approved_by, created_at, paid_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), NULL)`,
             [claim.submitted_by, claim.raw_text, claim.vendor, claim.amount, claim.category, claim.expense_date, claim.description, claim.status, null],
+            function insertSeedClaim(err) {
+              if (err) return console.error('Seed claim failed:', err.message);
+
+              const actorId = claim.status === 'paid'
+                ? userIds['finance@company.com']
+                : claim.status === 'submitted'
+                  ? claim.submitted_by
+                  : userIds['aditi.sharma@company.com'];
+
+              logClaimHistory(this.lastID, claim.status, actorId).catch((historyErr) => {
+                console.error('Seed history failed:', historyErr.message);
+              });
+            },
           );
         }
       } catch (error) {
@@ -132,72 +166,223 @@ const categories = ['Travel', 'Meals', 'Supplies', 'Taxi', 'Other'];
 
 const normalizeString = (value) => (value || '').toLowerCase().replace(/[^a-z0-9]/g, ' ').replace(/\s+/g, ' ').trim();
 
-const parseExpenseText = (rawText) => {
-  const text = rawText || '';
-  const lower = text.toLowerCase();
-  const vendorCandidates = [];
-  const amountMatch = text.match(/(rs\.?|inr|₹|rupees)?\s*\(?\d+(?:,\d{3})*(?:\.\d+)?\)?\s*(?:rs|inr|rupees)?/i);
-  const amountValue = amountMatch ? Number(String(amountMatch[0]).replace(/[^\d.]/g, '')) : 0;
+const parseExpenseTextFallback = (rawText) => {
+  const text = String(rawText || '').trim();
+  const amountMatch = text.match(/\d+(?:\.\d+)?/);
+  const amount = Number(amountMatch ? amountMatch[0] : 0);
 
-  const categoryMap = [
-    { keywords: ['uber', 'ola', 'train', 'flight', 'airport', 'hotel', 'bus', 'metro', 'airfare', 'travel'], category: 'Travel' },
-    { keywords: ['lunch', 'dinner', 'breakfast', 'swiggy', 'zomato', 'cafe', 'meal', 'food', 'snacks'], category: 'Meals' },
-    { keywords: ['printer', 'paper', 'pen', 'notebook', 'stationery', 'office', 'supplies', 'marker', 'ink'], category: 'Supplies' },
-    { keywords: ['taxi', 'cab', 'auto', 'rickshaw'], category: 'Taxi' },
+  const vendorMatches = [
+    /\buber\b/i,
+    /\bola\b/i,
+    /\bswiggy\b/i,
+    /\bzomato\b/i,
+    /\boffice depot\b/i,
+    /\bprinter cartridge\b/i,
+    /\bindian railways\b/i,
+    /\bhotel stay\b/i,
+    /\bcafe\b/i,
+    /\bclient lunch\b/i,
+    /\btrain\b/i,
+    /\bcab\b/i,
+    /\btaxi\b/i,
+    /\boffice\b/i,
+    /\bpaper\b/i,
+    /\bstationery\b/i,
+    /\bmarket\b/i,
+    /\bshop\b/i,
   ];
 
-  let category = 'Other';
-  for (const item of categoryMap) {
-    if (item.keywords.some((word) => lower.includes(word))) {
-      category = item.category;
+  let vendor = 'Unknown Vendor';
+  for (const pattern of vendorMatches) {
+    const match = text.match(pattern);
+    if (match) {
+      vendor = match[0].replace(/\s+/g, ' ').trim();
       break;
     }
   }
 
-  const dateMatch = text.match(/\b(\d{1,2})\s*(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|january|february|march|april|may|june|july|august|september|october|november|december)\b/i);
-  const dateAlt = text.match(/\b(\d{4}-\d{2}-\d{2}|\d{2}-\d{2}-\d{4}|\d{2}\/\d{2}\/\d{4})\b/);
-
-  let expenseDate = new Date().toISOString().slice(0, 10);
-  if (dateMatch) {
-    const day = dateMatch[1].padStart(2, '0');
-    const monthNames = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
-    const monthText = dateMatch[0].match(/(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|january|february|march|april|june|july|august|september|october|november|december)/i)[0].toLowerCase();
-    const monthIndex = monthNames.indexOf(monthText.slice(0, 3));
-    const year = new Date().getFullYear();
-    expenseDate = `${year}-${String(monthIndex + 1).padStart(2, '0')}-${day}`;
-  } else if (dateAlt) {
-    const alt = dateAlt[0];
-    if (alt.includes('-')) {
-      expenseDate = alt;
-    } else {
-      const [d, m, y] = alt.split(/[\/]/);
-      expenseDate = `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`;
-    }
+  if (vendor === 'Unknown Vendor') {
+    const beforeAmount = text.slice(0, text.search(/\d/)).trim();
+    vendor = beforeAmount.replace(/\b(?:to|from|for|on|at|with|and)\b.*$/gi, '').replace(/\s+/g, ' ').trim() || 'Unknown Vendor';
   }
 
-  const textWithoutNumbersRefs = text.replace(/\b(?:rs|inr|rupees|₹)\b/gi, '').replace(/\d+(?:,\d{3})*(?:\.\d+)?/g, '');
-  const words = textWithoutNumbersRefs.split(/\s+/).filter((w) => w.length > 2 && !['for', 'to', 'and', 'the', 'team', 'ride', 'lunch', 'dinner'].includes(w.toLowerCase()));
-  const vendor = words.slice(0, 3).join(' ') || 'Unknown Vendor';
+  const monthMap = {
+    jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06',
+    jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12',
+  };
 
-  const description = (() => {
-    const cleaned = text.replace(/\b(?:rs|inr|rupees|₹)\b/gi, '').replace(/\d+(?:,\d{3})*(?:\.\d+)?/g, '').replace(/\s+/g, ' ').trim();
-    return cleaned ? cleaned.slice(0, 120) : 'Expense claim';
+  let expenseDate = new Date().toISOString().slice(0, 10);
+  const dateMatch = text.match(/(\d{1,2})\s*(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*/i);
+  if (dateMatch) {
+    const day = String(dateMatch[1]).padStart(2, '0');
+    const month = monthMap[dateMatch[2].toLowerCase()];
+    const year = new Date().getFullYear();
+    expenseDate = `${year}-${month}-${day}`;
+  }
+
+  const category = (() => {
+    const lower = text.toLowerCase();
+    if (/uber|ola|taxi|cab|ride|train|flight|hotel|airport|travel|rail/.test(lower)) return 'Travel';
+    if (/taxi|cab|uber|ola/.test(lower)) return 'Taxi';
+    if (/lunch|dinner|coffee|snacks|meal|food|swiggy|zomato|cafe/.test(lower)) return 'Meals';
+    if (/notebook|pen|printer|marker|paper|stationery|office|supplies|ink|cartridge/.test(lower)) return 'Supplies';
+    return 'Other';
   })();
+
+  const description = text.replace(/\s+/g, ' ').trim();
 
   return {
     raw_text: text,
-    vendor: vendor.charAt(0).toUpperCase() + vendor.slice(1),
-    amount: Number(amountValue) || 0,
+    vendor: vendor || 'Unknown Vendor',
+    amount,
     category,
     expense_date: expenseDate,
     description: description || 'Expense claim',
   };
 };
 
+const resolveGeminiModelName = async (apiKey, preferredModel) => {
+  const candidateNames = [];
+  if (preferredModel) {
+    candidateNames.push(String(preferredModel).replace(/^models\//, ''));
+  }
+  candidateNames.push('gemini-2.5-flash', 'gemini-3.1-flash-lite', 'gemini-3.1-flash', 'gemini-3.6-flash');
+
+  const listUrl = `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey)}`;
+  const listResponse = await fetch(listUrl, { method: 'GET' });
+  const listBody = await listResponse.text();
+
+  if (!listResponse.ok) {
+    throw new Error(`Gemini model list request failed (${listResponse.status}): ${listBody}`);
+  }
+
+  let models = [];
+  try {
+    const payload = JSON.parse(listBody);
+    models = Array.isArray(payload.models) ? payload.models : [];
+  } catch (error) {
+    throw new Error('Gemini model list returned invalid JSON.');
+  }
+
+  const supported = models.filter((model) => Array.isArray(model.supportedGenerationMethods) && model.supportedGenerationMethods.includes('generateContent'));
+  const availableNames = supported.map((model) => String(model.name || '').replace(/^models\//, ''));
+
+  const selected = candidateNames.find((name) => availableNames.includes(name)) || availableNames[0];
+  if (!selected) {
+    throw new Error(`No Gemini model supports generateContent for this API key. Available models: ${availableNames.join(', ') || 'none'}`);
+  }
+
+  console.log('--- Gemini model list checked ---');
+  console.log(`Using Gemini model: ${selected}`);
+  console.log(`Available generateContent models: ${availableNames.join(', ')}`);
+
+  return selected;
+};
+
+const parseExpenseText = async (rawText) => {
+  const text = String(rawText || '').trim();
+  const apiKey = geminiApiKey;
+
+  if (!text) {
+    throw new Error('Raw receipt text is required');
+  }
+
+  if (!apiKey) {
+    console.log('--- Gemini fallback used ---');
+    console.log('No GEMINI_API_KEY configured. Using rule-based parser instead.');
+    return parseExpenseTextFallback(text);
+  }
+
+  try {
+    const modelName = await resolveGeminiModelName(apiKey, process.env.GEMINI_MODEL);
+    const prompt = `Extract structured expense claim data from the receipt text below. Return valid JSON only with exactly these keys: vendor, amount, category, expense_date, description.
+Rules:
+- vendor: merchant name only
+- amount: number without currency symbols or commas
+- category: must be one of "Travel", "Meals", "Supplies", "Taxi", "Other"
+- expense_date: valid date in YYYY-MM-DD format; use today's date if the receipt does not include a date
+- description: short summary of the expense
+- Do not include markdown fences or explanatory text
+Receipt text:
+${text}`;
+
+    console.log('--- Gemini prompt sent ---');
+    console.log(prompt);
+
+    const genAI = new GoogleGenerativeAI(apiKey);
+    const model = genAI.getGenerativeModel({
+      model: modelName,
+      generationConfig: {
+        temperature: 0.1,
+        responseMimeType: 'application/json',
+      },
+    });
+
+    const result = await model.generateContent(prompt);
+    const rawResponseText = JSON.stringify(result?.response, null, 2);
+
+    console.log('--- Gemini raw response ---');
+    console.log(rawResponseText);
+
+    const responseText = await result.response.text();
+    const cleaned = String(responseText).replace(/```json|```/gi, '').trim();
+
+    let parsed;
+    try {
+      parsed = JSON.parse(cleaned);
+    } catch (error) {
+      throw new Error('Gemini returned invalid JSON for the receipt parser.');
+    }
+
+    const normalized = {
+      raw_text: text,
+      vendor: String(parsed.vendor || 'Unknown Vendor').trim() || 'Unknown Vendor',
+      amount: Number(parsed.amount || 0),
+      category: categories.includes(parsed.category) ? parsed.category : 'Other',
+      expense_date: parsed.expense_date || new Date().toISOString().slice(0, 10),
+      description: String(parsed.description || 'Expense claim').trim() || 'Expense claim',
+    };
+
+    if (!Number.isFinite(normalized.amount) || normalized.amount <= 0) {
+      throw new Error('Gemini did not return a valid positive amount.');
+    }
+
+    return normalized;
+  } catch (error) {
+    const message = error && error.message ? error.message : String(error);
+    console.log('--- Gemini fallback used ---');
+    console.log(`Gemini failed: ${message}. Using rule-based parser instead.`);
+    return parseExpenseTextFallback(text);
+  }
+};
+
 const isPaidOrLocked = (status) => status === 'paid';
 
 const getUserById = (id) => new Promise((resolve, reject) => {
   db.get('SELECT * FROM users WHERE id = ?', [id], (err, row) => {
+    if (err) reject(err);
+    else resolve(row);
+  });
+});
+
+const logClaimHistory = (claimId, action, performedBy) => new Promise((resolve, reject) => {
+  if (!claimId) return reject(new Error('Claim id is required'));
+  if (!['submitted', 'approved', 'rejected', 'paid'].includes(action)) {
+    return reject(new Error('Unsupported claim action'));
+  }
+
+  db.run(
+    `INSERT INTO claim_history (claim_id, action, performed_by, timestamp) VALUES (?, ?, ?, datetime('now'))`,
+    [claimId, action, performedBy || null],
+    function insertHistory(err) {
+      if (err) reject(err);
+      else resolve(this.lastID);
+    },
+  );
+});
+
+const getClaimById = (claimId) => new Promise((resolve, reject) => {
+  db.get('SELECT * FROM claims WHERE id = ?', [claimId], (err, row) => {
     if (err) reject(err);
     else resolve(row);
   });
@@ -366,14 +551,18 @@ app.get('/api/dashboard/finance', requireUser, requireRole(['finance']), (req, r
   );
 });
 
-app.post('/api/parse-claim', requireUser, (req, res) => {
+app.post('/api/parse-claim', requireUser, async (req, res) => {
   const { raw_text } = req.body || {};
   if (!raw_text || !String(raw_text).trim()) {
     return res.status(400).json({ error: 'Raw receipt text is required' });
   }
 
-  const parsed = parseExpenseText(raw_text);
-  res.json({ parsed });
+  try {
+    const parsed = await parseExpenseText(raw_text);
+    res.json({ parsed });
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to parse claim with Gemini.' });
+  }
 });
 
 app.post('/api/claims', requireUser, requireRole(['staff', 'manager']), async (req, res) => {
@@ -408,13 +597,16 @@ app.post('/api/claims', requireUser, requireRole(['staff', 'manager']), async (r
       `INSERT INTO claims (submitted_by, raw_text, vendor, amount, category, expense_date, description, status, approved_by, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, 'submitted', NULL, datetime('now'))`,
       [req.user.id, raw_text, normalizedVendor, parsedAmount, category, expense_date, description],
-      function insertClaim(err) {
+      async function insertClaim(err) {
         if (err) return res.status(500).json({ error: err.message });
 
-        db.get('SELECT * FROM claims WHERE id = ?', [this.lastID], (claimErr, claim) => {
-          if (claimErr) return res.status(500).json({ error: claimErr.message });
+        try {
+          await logClaimHistory(this.lastID, 'submitted', req.user.id);
+          const claim = await getClaimById(this.lastID);
           res.status(201).json({ claim, duplicateWarning: Boolean(duplicate) });
-        });
+        } catch (historyErr) {
+          return res.status(500).json({ error: historyErr.message });
+        }
       },
     );
   });
@@ -431,7 +623,19 @@ app.get('/api/claims/:id', requireUser, (req, res) => {
     if (req.user.role === 'manager' && claim.submitted_by !== req.user.id && !req.user.manager_id) {
       return res.status(403).json({ error: 'Forbidden' });
     }
-    res.json({ claim });
+
+    db.all(
+      `SELECT h.*, u.name as performer_name
+       FROM claim_history h
+       LEFT JOIN users u ON u.id = h.performed_by
+       WHERE h.claim_id = ?
+       ORDER BY h.timestamp ASC`,
+      [req.params.id],
+      (historyErr, history) => {
+        if (historyErr) return res.status(500).json({ error: historyErr.message });
+        res.json({ claim, history });
+      },
+    );
   });
 });
 
@@ -467,12 +671,16 @@ app.patch('/api/claims/:id/status', requireUser, (req, res) => {
       db.run(
         `UPDATE claims SET status = ?, approved_by = ?, paid_at = ? WHERE id = ?`,
         [finalStatus, approverId, paidAt, claimId],
-        (updateErr) => {
+        async (updateErr) => {
           if (updateErr) return res.status(500).json({ error: updateErr.message });
-          db.get('SELECT * FROM claims WHERE id = ?', [claimId], (readErr, updatedClaim) => {
-            if (readErr) return res.status(500).json({ error: readErr.message });
+
+          try {
+            await logClaimHistory(claimId, finalStatus, approverId);
+            const updatedClaim = await getClaimById(claimId);
             res.json({ claim: updatedClaim });
-          });
+          } catch (historyErr) {
+            return res.status(500).json({ error: historyErr.message });
+          }
         },
       );
     } else if (status === 'paid') {
@@ -486,12 +694,16 @@ app.patch('/api/claims/:id/status', requireUser, (req, res) => {
       db.run(
         `UPDATE claims SET status = 'paid', paid_at = ? WHERE id = ?`,
         [new Date().toISOString(), claimId],
-        (updateErr) => {
+        async (updateErr) => {
           if (updateErr) return res.status(500).json({ error: updateErr.message });
-          db.get('SELECT * FROM claims WHERE id = ?', [claimId], (readErr, updatedClaim) => {
-            if (readErr) return res.status(500).json({ error: readErr.message });
+
+          try {
+            await logClaimHistory(claimId, 'paid', req.user.id);
+            const updatedClaim = await getClaimById(claimId);
             res.json({ claim: updatedClaim });
-          });
+          } catch (historyErr) {
+            return res.status(500).json({ error: historyErr.message });
+          }
         },
       );
     } else {
